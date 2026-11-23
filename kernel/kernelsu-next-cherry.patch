@@ -1,0 +1,193 @@
+diff --git a/kernel/Kconfig b/kernel/Kconfig
+index 88e22811..e7205ec7 100644
+--- a/kernel/Kconfig
++++ b/kernel/Kconfig
+@@ -43,4 +43,9 @@ config KSU_X86_PATCH_SYSCALL_DISPATCHER
+ 	  Dynamically patch x64's hardened syscall dispatcher to support syscall hooks. This is a
+ 	  replacement for a kernel source code patch, and is useful for x86_64 LKM mode.
+ 
++config CHERRY_KSU_STATIC_HOOKS
++	bool "SM-X610 built-in KernelSU syscall dispatch"
++	depends on ARM64 && KSU = y
++	default n
++
+ endmenu
+diff --git a/kernel/extras.c b/kernel/extras.c
+index 85be4d29..bc649c5f 100644
+--- a/kernel/extras.c
++++ b/kernel/extras.c
+@@ -191,6 +191,9 @@ void ksu_avc_spoof_enable(void)
+ 
+ void ksu_avc_spoof_late_init(void)
+ {
++	if (IS_ENABLED(CONFIG_CHERRY_KSU_STATIC_HOOKS))
++		return;
++
+ 	boot_completed = true;
+ 	
+     if (ksu_avc_spoof_enabled) {
+@@ -200,6 +203,9 @@ void ksu_avc_spoof_late_init(void)
+ 
+ void __init ksu_avc_spoof_init(void)
+ {
++	if (IS_ENABLED(CONFIG_CHERRY_KSU_STATIC_HOOKS))
++		return;
++
+ 	if (ksu_register_feature_handler(&avc_spoof_handler)) {
+ 		pr_err("Failed to register avc spoof feature handler\n");
+ 	}
+diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
+index 459f99f9..d1b9ed1b 100644
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -516,6 +516,9 @@ static const struct ksu_feature_handler selinux_hide_handler = {
+ 
+ void ksu_selinux_hide_handle_second_stage()
+ {
++    if (IS_ENABLED(CONFIG_CHERRY_KSU_STATIC_HOOKS))
++        return;
++
+     initialize_fake_status();
+     // https://github.com/torvalds/linux/blame/e8c2f9fdadee7cbc75134dc463c1e0d856d6e5c7/security/selinux/selinuxfs.c#L2014
+     if (fake_status) {
+@@ -527,6 +530,9 @@ void ksu_selinux_hide_handle_second_stage()
+ 
+ void ksu_selinux_hide_handle_post_fs_data()
+ {
++    if (IS_ENABLED(CONFIG_CHERRY_KSU_STATIC_HOOKS))
++        return;
++
+     static_key_disable(&fake_status_initialize_key.key);
+     if (!fake_status) {
+         pr_err("selinux_hide: fake status is not initialized after post-fs-data!\n");
+@@ -557,6 +563,9 @@ static void hook_selinux_status_open()
+ 
+ void __init ksu_selinux_hide_init()
+ {
++    if (IS_ENABLED(CONFIG_CHERRY_KSU_STATIC_HOOKS))
++        return;
++
+     if (ksu_register_feature_handler(&selinux_hide_handler)) {
+         pr_err("Failed to register selinux_hide feature handler\n");
+     }
+diff --git a/kernel/hook/arm64/syscall_hook.c b/kernel/hook/arm64/syscall_hook.c
+index 7bd6df06..a83abcc9 100644
+--- a/kernel/hook/arm64/syscall_hook.c
++++ b/kernel/hook/arm64/syscall_hook.c
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/kallsyms.h>
+ #include <linux/mutex.h>
++#include <linux/cherry_ksu.h>
+ #include <asm/cacheflush.h>
+ #include "infra/symbol_resolver.h"
+ #include "../patch_memory.h"
+@@ -17,6 +18,53 @@ int ksu_dispatcher_nr = -1;
+ // context, written with WRITE_ONCE from init/exit context.
+ static ksu_syscall_hook_fn syscall_hooks[__NR_syscalls];
+ 
++#ifdef CONFIG_CHERRY_KSU_STATIC_HOOKS
++/*
++ * The native arm64 dispatch calls this after seccomp and Samsung DEFEX.
++ * Init's two temporary bootstrap callbacks retain the original syscall
++ * pointers. The kernel's read-only syscall table is never modified here.
++ */
++static syscall_fn_t init_read_hook;
++static syscall_fn_t init_fstat_hook;
++
++bool cherry_ksu_dispatch(const struct pt_regs *regs, unsigned int nr, long *result)
++{
++    syscall_fn_t init_hook = NULL;
++    ksu_syscall_hook_fn hook;
++
++    if (unlikely(is_global_init(current))) {
++        if (nr == __NR_read)
++            init_hook = smp_load_acquire(&init_read_hook);
++        else if (nr == __NR_fstat)
++            init_hook = smp_load_acquire(&init_fstat_hook);
++
++        if (init_hook) {
++            *result = init_hook(regs);
++            return true;
++        }
++    }
++
++    if (!test_thread_flag(TIF_SYSCALL_TRACEPOINT) || nr >= __NR_syscalls)
++        return false;
++
++    hook = READ_ONCE(syscall_hooks[nr]);
++    if (!hook)
++        return false;
++
++    *result = hook(nr, regs);
++    return true;
++}
++
++static syscall_fn_t *cherry_init_hook_slot(int nr)
++{
++    if (nr == __NR_read)
++        return &init_read_hook;
++    if (nr == __NR_fstat)
++        return &init_fstat_hook;
++    return NULL;
++}
++#endif
++
+ // Track all hooked syscall entries for restoration.
+ // Protected by hooked_entries_lock.
+ struct syscall_hook_entry {
+@@ -51,6 +99,15 @@ static int patch_syscall_table(int nr, syscall_fn_t fn)
+ // save original to *old, and record for restoration at module exit.
+ void ksu_syscall_table_hook(int nr, syscall_fn_t fn, syscall_fn_t *old)
+ {
++#ifdef CONFIG_CHERRY_KSU_STATIC_HOOKS
++    syscall_fn_t *slot = cherry_init_hook_slot(nr);
++
++    if (WARN_ON_ONCE(!slot || !old || !fn))
++        return;
++    *old = sys_call_table[nr];
++    smp_store_release(slot, fn);
++    return;
++#endif
+     if (ksu_syscall_table == NULL)
+         return;
+     if (nr < 0 || nr >= __NR_syscalls) {
+@@ -93,6 +150,13 @@ void ksu_syscall_table_hook(int nr, syscall_fn_t fn, syscall_fn_t *old)
+ // Restore syscall_table[nr] to its original value and remove from tracking list.
+ void ksu_syscall_table_unhook(int nr)
+ {
++#ifdef CONFIG_CHERRY_KSU_STATIC_HOOKS
++    syscall_fn_t *slot = cherry_init_hook_slot(nr);
++
++    if (slot)
++        smp_store_release(slot, NULL);
++    return;
++#endif
+     int i;
+ 
+     if (ksu_syscall_table == NULL)
+@@ -202,6 +266,11 @@ bool ksu_has_syscall_hook(int nr)
+ 
+ void __init ksu_syscall_hook_init(void)
+ {
++#ifdef CONFIG_CHERRY_KSU_STATIC_HOOKS
++    ksu_syscall_table = (syscall_fn_t *)sys_call_table;
++    pr_info("Cherry Kernel: native KernelSU syscall dispatch ready\n");
++    return;
++#endif
+     int ni_slot;
+ 
+     memset(syscall_hooks, 0, sizeof(syscall_hooks));
+diff --git a/kernel/hook/syscall_hook_manager.c b/kernel/hook/syscall_hook_manager.c
+index cf21fed8..7c625b13 100644
+--- a/kernel/hook/syscall_hook_manager.c
++++ b/kernel/hook/syscall_hook_manager.c
+@@ -96,6 +96,8 @@ static struct kretprobe *syscall_unregfunc_rp = NULL;
+ // sys_enter handler: redirect hooked syscalls to the dispatcher
+ static void ksu_sys_enter_handler(void *data, struct pt_regs *regs, long id)
+ {
++    if (IS_ENABLED(CONFIG_CHERRY_KSU_STATIC_HOOKS))
++        return;
+ #if defined(__x86_64__)
+     if (unlikely(in_compat_syscall()))
+ #elif defined(__aarch64__) || defined(__riscv)

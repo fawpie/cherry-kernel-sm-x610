@@ -1,0 +1,298 @@
+#!/sbin/sh
+# TWRP update-binary for the Galaxy Tab S9 FE+ Wi-Fi, X610XXU7CYE1.
+
+ui_fd=$2
+archive=$3
+case "$ui_fd" in ''|*[!0-9]*) exit 1 ;; esac
+
+ui() {
+    case "$ui_fd" in
+        [0-9]) printf 'ui_print %s\nui_print\n' "$*" >&"$ui_fd" ;;
+        *) printf 'ui_print %s\nui_print\n' "$*" >> "/proc/self/fd/$ui_fd" ;;
+    esac
+}
+
+fail() {
+    ui "Error: $*"
+    exit 1
+}
+
+[ -f "$archive" ] || fail "The ZIP is unavailable."
+[ -n "$(getprop ro.twrp.version)" ] || fail "TWRP is required."
+case "$(getprop ro.product.device):$(getprop ro.product.vendor.device):$(getprop ro.product.model)" in
+    gts9fepwifi:*|*:gts9fepwifi:*|*:*:SM-X610) ;;
+    *) fail "This package requires the SM-X610 Wi-Fi tablet." ;;
+esac
+bootloader=$(getprop ro.bootloader)
+[ -n "$bootloader" ] || bootloader=$(getprop ro.boot.bootloader)
+[ "$bootloader" = X610XXU7CYE1 ] || fail "X610XXU7CYE1 firmware is required."
+
+boot=/dev/block/by-name/boot
+init_boot=/dev/block/by-name/init_boot
+[ -b "$boot" ] && [ -b "$init_boot" ] || fail "Cannot find boot and init_boot."
+[ "$(readlink -f "$boot")" != "$(readlink -f "$init_boot")" ] || fail "Partition paths overlap."
+[ "$(blockdev --getsize64 "$boot")" = 67108864 ] &&
+    [ "$(blockdev --getsize64 "$init_boot")" = 16777216 ] || fail "Unexpected partition sizes."
+
+work=$(mktemp -d /tmp/cherry-flasher.XXXXXXXX) || fail "Cannot allocate temporary storage."
+event_pid=
+key_fd=7
+[ "$ui_fd" = 7 ] && key_fd=8
+boot_written=
+init_written=
+
+stop_keys() {
+    if [ -n "$event_pid" ]; then
+        kill "$event_pid" 2>/dev/null
+        wait "$event_pid" 2>/dev/null
+        event_pid=
+        case "$key_fd" in 7) exec 7<&- ;; 8) exec 8<&- ;; esac
+    fi
+}
+
+cleanup() {
+    stop_keys
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+start_keys() {
+    fifo="$work/keys"
+    [ -p "$fifo" ] || mkfifo "$fifo" || fail "Cannot prepare the volume key reader."
+    getevent -ql > "$fifo" 2>/dev/null &
+    event_pid=$!
+    case "$key_fd" in 7) exec 7< "$fifo" ;; 8) exec 8< "$fifo" ;; esac
+}
+
+next_key() {
+    remaining=$((deadline - SECONDS))
+    while [ "$remaining" -gt 0 ] && IFS= read -r -t "$remaining" -u"$key_fd" event; do
+        case "$event" in
+            *'EV_KEY '*KEY_VOLUMEUP*' DOWN'*) key=up; return ;;
+            *'EV_KEY '*KEY_VOLUMEDOWN*' DOWN'*) key=down; return ;;
+        esac
+        remaining=$((deadline - SECONDS))
+    done
+    ui "Selection timed out. No partitions were written."
+    exit 0
+}
+
+ui "Cherry Kernel for SM-X610"
+ui "Volume Up: Samsung stock kernel"
+ui "Volume Down: Cherry Kernel"
+start_keys
+deadline=$((SECONDS + 60))
+next_key
+stop_keys
+
+stock_init=stock-init_boot.img
+target_init=$stock_init
+if [ "$key" = up ]; then
+    selection="Samsung stock without root"
+    target_boot=stock-boot.img
+else
+    start_keys
+    choice=0
+    while :; do
+        case "$choice" in
+            0) selection="Cherry without root"; target_boot=cherry-standard-boot.img; target_init=$stock_init ;;
+            1) selection="Cherry with KernelSU Next 3.4.2"; target_boot=cherry-ksun-boot.img; target_init=$stock_init ;;
+            2) selection="Cherry with Magisk 31.1"; target_boot=cherry-standard-boot.img; target_init=magisk-init_boot.img ;;
+        esac
+        ui "$selection"
+        ui "Volume Up: select   Volume Down: next option"
+        deadline=$((SECONDS + 60))
+        next_key
+        [ "$key" = up ] && break
+        choice=$(((choice + 1) % 3))
+    done
+    stop_keys
+fi
+
+ui "Include Cherry Manager 1.3.0?"
+ui "Full kernel controls require root permission in KernelSU Next or Magisk."
+ui "Volume Up: include the app   Volume Down: skip"
+start_keys
+deadline=$((SECONDS + 60))
+next_key
+stop_keys
+include_manager=$key
+
+ui "Checking images and current firmware."
+unpack() {
+    unzip -p "$archive" "$1" > "$2" && [ -s "$2" ]
+}
+
+digest() {
+    result=$(sha256sum < "$1") || return 1
+    printf '%s' "${result%% *}"
+}
+
+metadata() {
+    awk -v id="$1" '$1 == id { print $2; matches++ } END { if (matches != 1) exit 1 }' "$work/manifest"
+}
+
+verify() {
+    [ -n "$2" ] && [ "$(digest "$1")" = "$2" ]
+}
+
+unpack cherry/manifest "$work/manifest" || fail "Cannot read the ZIP manifest."
+unpack cherry/magiskboot "$work/magiskboot" &&
+    verify "$work/magiskboot" "$(metadata magiskboot)" || fail "Boot image tool failed verification."
+chmod 700 "$work/magiskboot" || fail "Cannot prepare the boot image tool."
+unpack "cherry/$target_boot" "$work/new-boot" &&
+    verify "$work/new-boot" "$(metadata "$target_boot")" &&
+    [ "$(wc -c < "$work/new-boot")" = 67108864 ] || fail "Selected boot image failed verification."
+unpack "cherry/$target_init" "$work/new-init" &&
+    verify "$work/new-init" "$(metadata "$target_init")" &&
+    [ "$(wc -c < "$work/new-init")" = 16777216 ] || fail "Selected init_boot image failed verification."
+if [ "$include_manager" = up ]; then
+    unpack Cherry-Manager.apk "$work/manager.apk" &&
+        verify "$work/manager.apk" "$(metadata Cherry-Manager.apk)" || fail "Cherry Manager failed verification."
+    if [ "$target_boot" = cherry-ksun-boot.img ] || [ "$target_init" = magisk-init_boot.img ]; then
+        unpack cherry/install-manager-on-boot.sh "$work/install-manager.sh" &&
+            verify "$work/install-manager.sh" "$(metadata install-manager-on-boot.sh)" ||
+            fail "Cherry Manager's boot installer failed verification."
+    fi
+fi
+
+dd if="$boot" of="$work/old-boot" bs=1048576 count=64 2>/dev/null &&
+    [ "$(wc -c < "$work/old-boot")" = 67108864 ] || fail "Cannot back up boot."
+dd if="$init_boot" of="$work/old-init" bs=1048576 count=16 2>/dev/null &&
+    [ "$(wc -c < "$work/old-init")" = 16777216 ] || fail "Cannot back up init_boot."
+old_boot_hash=$(digest "$work/old-boot") || fail "Cannot verify the boot backup."
+old_init_hash=$(digest "$work/old-init") || fail "Cannot verify the init_boot backup."
+
+(
+    mkdir "$work/check" && cd "$work/check" || exit 1
+    "$work/magiskboot" unpack -h "$work/old-boot" >/dev/null 2>&1 &&
+        [ -s kernel ] && [ ! -e ramdisk.cpio ] || exit 1
+    kernel_hash=$(digest kernel) || exit 1
+    grep -Fxq "kernel $kernel_hash" "$work/manifest" || exit 1
+    [ "$(digest header)" = "$(metadata stock-boot-header)" ]
+) || fail "The installed boot image is outside the supported X610XXU7CYE1 kernels."
+
+if [ "$old_init_hash" != "$(metadata "$stock_init")" ] &&
+    [ "$old_init_hash" != "$(metadata magisk-init_boot.img)" ]; then
+    (
+        mkdir "$work/check-init" && cd "$work/check-init" || exit 1
+        "$work/magiskboot" unpack -h "$work/old-init" >/dev/null 2>&1 &&
+            [ ! -e kernel ] && [ -s ramdisk.cpio ] &&
+            [ "$(digest header)" = "$(metadata stock-init-header)" ] || exit 1
+        verify ramdisk.cpio "$(metadata stock-init-ramdisk)" && exit 0
+        "$work/magiskboot" cpio ramdisk.cpio test >/dev/null 2>&1
+        [ "$?" = 1 ] || exit 1
+        "$work/magiskboot" cpio ramdisk.cpio "extract .backup/.magisk magisk-config" >/dev/null 2>&1 &&
+            chmod 600 magisk-config &&
+            grep -Fxq "SHA1=$(metadata stock-init-sha1)" magisk-config
+    ) || fail "The installed init_boot is outside the supported stock or Magisk images."
+fi
+
+ui "Install $selection?"
+ui "This selects the boot and init_boot pair, including its root method."
+if [ "$include_manager" = up ]; then
+    if [ -f "$work/install-manager.sh" ]; then
+        ui "Cherry Manager: install after Android starts if /data is available."
+    else
+        ui "Cherry Manager: copy the APK for manual installation in Android."
+    fi
+fi
+ui "Volume Up: install   Volume Down: cancel"
+start_keys
+deadline=$((SECONDS + 60))
+next_key
+stop_keys
+if [ "$key" = down ]; then
+    ui "Cancelled. No partitions were written."
+    exit 0
+fi
+
+write_partition() {
+    dd if="$1" of="$2" bs=1048576 2>/dev/null && sync && verify "$2" "$3"
+}
+
+rollback() {
+    trap '' HUP INT TERM
+    restored=1
+    if [ -n "$boot_written" ]; then
+        write_partition "$work/old-boot" "$boot" "$old_boot_hash" || restored=0
+    fi
+    if [ -n "$init_written" ]; then
+        write_partition "$work/old-init" "$init_boot" "$old_init_hash" || restored=0
+    fi
+    if [ "$restored" = 1 ]; then
+        fail "Installation stopped. The original images were restored and verified."
+    fi
+    fail "Restoration failed verification. Stay in TWRP and restore the original images."
+}
+trap rollback HUP INT TERM
+
+install_boot() {
+    expected=$(metadata "$target_boot") || rollback
+    [ "$expected" = "$old_boot_hash" ] && return
+    boot_written=1
+    write_partition "$work/new-boot" "$boot" "$expected" || rollback
+}
+
+install_init() {
+    expected=$(metadata "$target_init") || rollback
+    [ "$expected" = "$old_init_hash" ] && return
+    init_written=1
+    write_partition "$work/new-init" "$init_boot" "$expected" || rollback
+}
+
+if [ "$target_init" = "$stock_init" ]; then
+    install_init
+    install_boot
+else
+    install_boot
+    install_init
+fi
+trap - HUP INT TERM
+ui "$selection installed and verified."
+
+schedule_manager() {
+    awk '$2 == "/data" { mounted = 1 } END { exit !mounted }' /proc/mounts || return 1
+    [ ! -L /data/adb ] && [ ! -L /data/adb/service.d ] || return 1
+    directory=/data/adb/cherry-manager-install
+    hook=/data/adb/service.d/99-cherry-manager-install.sh
+    mkdir -p /data/adb/service.d || return 1
+    [ ! -e "$hook" ] && [ ! -L "$hook" ] && mkdir -m 700 "$directory" || return 1
+    if cp "$work/manager.apk" "$directory/Cherry-Manager.apk" &&
+        cp "$work/install-manager.sh" "$directory/install.sh" &&
+        chmod 700 "$directory/install.sh" &&
+        chown 0:0 "$directory" "$directory/Cherry-Manager.apk" "$directory/install.sh" &&
+        mv "$directory/install.sh" "$hook"; then
+        return 0
+    fi
+    rm -f "$directory/install.sh" "$directory/Cherry-Manager.apk"
+    rmdir "$directory"
+    return 1
+}
+
+copy_manager() {
+    apk_hash=$(metadata Cherry-Manager.apk) || return 1
+    for folder in /sdcard/Download "${archive%/*}"; do
+        [ -d "$folder" ] && [ -w "$folder" ] || continue
+        apk="$folder/Cherry-Manager-1.3.0.apk"
+        if [ -e "$apk" ] || [ -L "$apk" ]; then
+            verify "$apk" "$apk_hash" && { ui "Open $apk in Android."; return 0; }
+            continue
+        fi
+        if cp "$work/manager.apk" "$apk" && verify "$apk" "$apk_hash"; then
+            ui "Open $apk in Android."
+            return 0
+        fi
+        rm -f "$apk"
+    done
+    return 1
+}
+
+if [ "$include_manager" = up ]; then
+    if [ -f "$work/install-manager.sh" ] && schedule_manager; then
+        ui "Cherry Manager will install when Android starts."
+    else
+        copy_manager || ui "Extract Cherry-Manager.apk from this ZIP to install it in Android."
+    fi
+fi
+ui "Reboot System when ready."

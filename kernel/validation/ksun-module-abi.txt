@@ -1,0 +1,4 @@
+286 unique stock modules, 2420 symbols supplied by stock modules
+0 signed stock modules
+7867 versioned symbols exported by the rebuilt kernel
+0 symbols with mismatched CRC and 0 unresolved symbols
