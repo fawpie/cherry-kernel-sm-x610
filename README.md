@@ -28,7 +28,6 @@ Cherry keeps the stock CPU and GPU frequency tables and Samsung’s thermal limi
 | --- | --- |
 | Tablet | Samsung Galaxy Tab S9 FE+ Wi-Fi, `SM-X610`, `gts9fepwifi` |
 | System | Samsung stock One UI 7.0, Android 15 |
-| Firmware build | `X610XXU7CYE1` |
 | Recovery | TWRP R7 built for SM-X610 |
 | Bootloader | Unlocked |
 
@@ -37,7 +36,7 @@ Use the exact firmware above. Support for other AP builds, the SM-X616 cellular 
 ## Installation
 
 1. Confirm the model and build number under **Settings → About tablet → Software information**. Back up your data and keep the matching stock `boot` and `init_boot` images available before starting.
-2. Download `SM-X610-X610XXU7CYE1-Cherry-All-in-One-TWRP.zip` and verify it against `SHA256SUMS.txt` from the release. On Windows, use `Get-FileHash <file> -Algorithm SHA256`. On Linux, use `sha256sum -c SHA256SUMS.txt --ignore-missing`.
+2. Download `SM-X610-Cherry-All-in-One-TWRP.zip` and verify it against `SHA256SUMS.txt` from the release. On Windows, use `Get-FileHash <file> -Algorithm SHA256`. On Linux, use `sha256sum -c SHA256SUMS.txt --ignore-missing`.
 3. Boot into TWRP R7, select the ZIP under **Install**, and swipe to start. The installer menu appears in the recovery log. **Volume Up** selects Samsung stock. **Volume Down** opens the Cherry choices.
 4. In the Cherry menu, use **Volume Down** to cycle through the root options. Press **Volume Up** to select. The installer then asks whether to include Cherry Manager. **Volume Up** includes it and **Volume Down** skips it.
 5. Review the final choice. Press **Volume Up** to flash or **Volume Down** to cancel. The installer times out without flashing if a choice is left unanswered for 60 seconds.
